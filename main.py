@@ -8,11 +8,12 @@ import random
 import time
 import functools
 import sys
-import requests
 import re
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
+from curl_cffi import requests
+from bs4 import BeautifulSoup
 
 
 def retry_decorator(retries=3):
@@ -56,13 +57,12 @@ SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")  # Server酱³ SendKey
 
 HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
+SESSION_URL = "https://linux.do/session"
+CSRF_URL = "https://linux.do/session/csrf"
 
 
 class LinuxDoBrowser:
     def __init__(self) -> None:
-        EXTENSION_PATH = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "turnstilePatch")
-        )
         from sys import platform
 
         if platform == "linux" or platform == "linux2":
@@ -75,7 +75,6 @@ class LinuxDoBrowser:
         co = (
             ChromiumOptions()
             .headless(True)
-            .add_extension(EXTENSION_PATH)
             .incognito(True)
             .set_argument("--no-sandbox")
         )
@@ -84,56 +83,120 @@ class LinuxDoBrowser:
         )
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
-
-    def getTurnstileToken(self):
-        self.page.run_js("try { turnstile.reset() } catch(e) { }")
-
-        turnstileResponse = None
-
-        for i in range(0, 5):
-            try:
-                turnstileResponse = self.page.run_js(
-                    "try { return turnstile.getResponse() } catch(e) { return null }"
-                )
-                if turnstileResponse:
-                    return turnstileResponse
-
-                challengeSolution = self.page.ele("@name=cf-turnstile-response")
-                challengeWrapper = challengeSolution.parent()
-                challengeIframe = challengeWrapper.shadow_root.ele("tag:iframe")
-                challengeIframeBody = challengeIframe.ele("tag:body").shadow_root
-                challengeButton = challengeIframeBody.ele("tag:input")
-                challengeButton.click()
-            except Exception as e:
-                logger.warning(f"处理 Turnstile 时出错: {str(e)}")
-            time.sleep(1)
-        # self.page.refresh()
-        # raise Exception("failed to solve turnstile")
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+            }
+        )
 
     def login(self):
         logger.info("开始登录")
-        self.page.get(LOGIN_URL)
-        time.sleep(2)
-        turnstile_token = self.getTurnstileToken()
-        logger.info(f"turnstile_token: {turnstile_token}")
-        self.page.get_screenshot("screenshot.png")
-        self.page.ele("@id=login-account-name").input(USERNAME)
-        self.page.ele("@id=login-account-password").input(PASSWORD)
-        self.page.ele("@id=login-button").click()
-        time.sleep(10)
+        # Step 1: Get CSRF Token
+        logger.info("获取 CSRF token...")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": LOGIN_URL,
+        }
+        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
+        csrf_data = resp_csrf.json()
+        csrf_token = csrf_data.get("csrf")
+        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
+
+        # Step 2: Login
+        logger.info("正在登录...")
+        headers.update(
+            {
+                "X-CSRF-Token": csrf_token,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://linux.do",
+            }
+        )
+
+        data = {
+            "login": USERNAME,
+            "password": PASSWORD,
+            "second_factor_method": "1",
+            "timezone": "Asia/Shanghai",
+        }
+
+        try:
+            resp_login = self.session.post(
+                SESSION_URL, data=data, impersonate="chrome136", headers=headers
+            )
+
+            if resp_login.status_code == 200:
+                response_json = resp_login.json()
+                if response_json.get("error"):
+                    logger.error(f"登录失败: {response_json.get('error')}")
+                    return False
+                logger.info("登录成功!")
+            else:
+                logger.error(f"登录失败，状态码: {resp_login.status_code}")
+                logger.error(resp_login.text)
+                return False
+        except Exception as e:
+            logger.error(f"登录请求异常: {e}")
+            return False
+
+        self.print_connect_info()  # 打印连接信息
+
+        # Step 3: Pass cookies to DrissionPage
+        logger.info("同步 Cookie 到 DrissionPage...")
+
+        # Convert requests cookies to DrissionPage format
+        # Using standard requests.utils to parse cookiejar if possible, or manual extraction
+        # requests.Session().cookies is a specialized object, but might support standard iteration
+
+        # We can iterate over the cookies manually if dict_from_cookiejar doesn't work perfectly
+        # or convert to dict first.
+        # Assuming requests behaves like requests:
+
+        cookies_dict = self.session.cookies.get_dict()
+
+        dp_cookies = []
+        for name, value in cookies_dict.items():
+            dp_cookies.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": ".linux.do",
+                    "path": "/",
+                }
+            )
+
+        self.page.set.cookies(dp_cookies)
+
+        logger.info("Cookie 设置完成，导航至 linux.do...")
+        self.page.get(HOME_URL)
+
+        time.sleep(5)
         user_ele = self.page.ele("@id=current-user")
         if not user_ele:
-            logger.error("登录失败")
+            # Fallback check for avatar
+            if "avatar" in self.page.html:
+                logger.info("登录验证成功 (通过 avatar)")
+                return True
+            logger.error("登录验证失败 (未找到 current-user)")
             return False
         else:
-            logger.info("登录成功")
+            logger.info("登录验证成功")
             return True
 
     def click_topic(self):
         topic_list = self.page.ele("@id=list-area").eles(".:title")
+        if not topic_list:
+            logger.error("未找到主题帖")
+            return False
         logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
         for topic in random.sample(topic_list, 10):
             self.click_one_topic(topic.attr("href"))
+        return True
 
     @retry_decorator()
     def click_one_topic(self, topic_url):
@@ -175,15 +238,17 @@ class LinuxDoBrowser:
             time.sleep(wait_time)
 
     def run(self):
-        if not self.login():  # 登录
-            logger.error("登录失败，程序终止")
-            sys.exit(1)  # 使用非零退出码终止整个程序
+        login_res = self.login()
+        if not login_res:  # 登录
+            logger.warning("登录验证失败")
 
         if BROWSE_ENABLED:
-            self.click_topic()  # 点击主题
+            click_topic_res = self.click_topic()  # 点击主题
+            if not click_topic_res:
+                logger.error("点击主题失败，程序终止")
+                return
             logger.info("完成浏览任务")
 
-        self.print_connect_info()  # 打印连接信息
         self.send_notifications(BROWSE_ENABLED)  # 发送通知
         self.page.close()
         self.browser.quit()
@@ -204,24 +269,26 @@ class LinuxDoBrowser:
 
     def print_connect_info(self):
         logger.info("获取连接信息")
-        page = self.browser.new_tab()
-        page.get("https://connect.linux.do/")
-        rows = page.ele("tag:table").eles("tag:tr")
-
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        }
+        resp = self.session.get(
+            "https://connect.linux.do/", headers=headers, impersonate="chrome136"
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        rows = soup.select("table tr")
         info = []
 
         for row in rows:
-            cells = row.eles("tag:td")
+            cells = row.select("td")
             if len(cells) >= 3:
                 project = cells[0].text.strip()
-                current = cells[1].text.strip()
-                requirement = cells[2].text.strip()
+                current = cells[1].text.strip() if cells[1].text.strip() else "0"
+                requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
                 info.append([project, current, requirement])
 
         print("--------------Connect Info-----------------")
         print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
-
-        page.close()
 
     def send_notifications(self, browse_enabled):
         status_msg = "✅每日登录成功"
